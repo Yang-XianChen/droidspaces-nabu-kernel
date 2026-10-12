@@ -1,0 +1,102 @@
+name: Diagnose toolchain variables (nabu)
+
+# 只做诊断,不编译。用于查清 4.14 树上 LLVM=1 时 LD/AS 等变量为何解析异常,
+# 以及 vdso 链接命令到底长什么样。
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        required: true
+        default: 'crdroidandroid/android_kernel_xiaomi_sm8150'
+      kernel_ref:
+        required: true
+        default: '16.0'
+
+jobs:
+  diag:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl device-tree-compiler flex gawk \
+            git gnupg gperf imagemagick kmod libelf-dev libncurses-dev libssl-dev \
+            libxml2 libxml2-utils lzop pngcrush python3 rsync schedtool \
+            squashfs-tools xsltproc zip zlib1g-dev
+
+      - name: 源码
+        run: |
+          set -eux
+          mkdir -p kernel
+          curl -fsSL "https://codeload.github.com/${{ inputs.kernel_repo }}/tar.gz/${{ inputs.kernel_ref }}" \
+            | tar -xz --strip-components=1 -C kernel
+          test -f kernel/Makefile
+
+      - name: 工具链
+        run: |
+          set -eux
+          mkdir -p "$HOME/zyc-clang"
+          cd "$HOME/zyc-clang"
+          curl -fsSL -o c.tar.gz \
+            "https://github.com/ZyCromerZ/Clang/releases/download/16.0.6-20260510-release/Clang-16.0.6-20260510.tar.gz"
+          tar -xzf c.tar.gz
+          rm -f c.tar.gz
+          echo "$HOME/zyc-clang/bin" >> "$GITHUB_PATH"
+
+      - name: 诊断
+        run: |
+          set -ux
+          export PATH="$HOME/zyc-clang/bin:$PATH"
+
+          echo "############ 1. 工具链里到底有哪些工具 ############"
+          ls "$HOME/zyc-clang/bin" | grep -iE "^(ld|lld|clang|llvm-ar|llvm-nm|llvm-objcopy|llvm-objdump|llvm-readelf|llvm-strip)" || echo "(匹配不到)"
+          echo "--- which ---"
+          for t in clang ld.lld ld.lld.real llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
+            printf '  %-16s %s\n' "$t" "$(command -v $t 2>/dev/null || echo '缺失')"
+          done
+          echo "--- ld.lld 类型(是不是 wrapper 脚本)---"
+          file "$(command -v ld.lld 2>/dev/null)" 2>/dev/null || true
+          head -5 "$(command -v ld.lld 2>/dev/null)" 2>/dev/null || true
+
+          echo
+          echo "############ 2. 环境里是否有异常的 SHELL/BASH ############"
+          env | grep -iE "^(SHELL|BASH|MAKESHELL|CONFIG_SHELL)=" || echo "  (无相关环境变量)"
+
+          echo
+          echo "############ 3. 生成 .config ############"
+          cd kernel
+          C=arch/arm64/configs
+          cat "$C/vendor/sm8150-perf_defconfig" "$C/vendor/debugfs.config" \
+              "$C/vendor/xiaomi/sm8150-common.config" "$C/vendor/xiaomi/nabu.config" \
+              > "$C/diag_defconfig"
+
+          MO=(-j"$(nproc)" O=out ARCH=arm64 SUBARCH=arm64 LLVM=1 LLVM_IAS=1
+              CC="ccache clang" HOSTCC="ccache clang"
+              CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-)
+          make "${MO[@]}" diag_defconfig > /tmp/cfg.log 2>&1 || true
+          make "${MO[@]}" olddefconfig  > /tmp/cfg.log 2>&1 || true
+
+          echo
+          echo "############ 4. make 最终解析出的变量(方案A:LLVM=1)############"
+          make "${MO[@]}" --eval='diagvars: ; @printf "  LD=[%s]\n  AS=[%s]\n  CC=[%s]\n  AR=[%s]\n  NM=[%s]\n  OBJCOPY=[%s]\n  CROSS_COMPILE=[%s]\n  LLVM=[%s]\n  LLVM_IAS=[%s]\n  ld-name=[%s]\n" "$(LD)" "$(AS)" "$(CC)" "$(AR)" "$(NM)" "$(OBJCOPY)" "$(CROSS_COMPILE)" "$(LLVM)" "$(LLVM_IAS)" "$(ld-name)"' diagvars 2>&1 | grep -E "LD=|AS=|CC=|AR=|NM=|OBJCOPY=|CROSS_COMPILE=|LLVM=|ld-name=" | head -20
+
+          echo
+          echo "############ 5. vdso 链接命令(dry-run,方案A)############"
+          rm -f arch/arm64/kernel/vdso/vdso.so.dbg
+          make "${MO[@]}" -n arch/arm64/kernel/vdso/vdso.so.dbg 2>&1 | tail -5
+
+          echo
+          echo "############ 6. 方案B:不用 LLVM=1,显式传工具,vdso 命令 ############"
+          MO2=(-j"$(nproc)" O=out ARCH=arm64 SUBARCH=arm64
+               CC=clang CLANG_TRIPLE=aarch64-linux-gnu-
+               CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+               LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy
+               OBJDUMP=llvm-objdump READELF=llvm-readelf STRIP=llvm-strip LLVM_IAS=1)
+          make "${MO2[@]}" --eval='diagvars2: ; @printf "  LD=[%s]\n  AS=[%s]\n  CC=[%s]\n" "$(LD)" "$(AS)" "$(CC)"' diagvars2 2>&1 | grep -E "LD=|AS=|CC=" | head -5
+          rm -f arch/arm64/kernel/vdso/vdso.so.dbg
+          make "${MO2[@]}" -n arch/arm64/kernel/vdso/vdso.so.dbg 2>&1 | tail -5
