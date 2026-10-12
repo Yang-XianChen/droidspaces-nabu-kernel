@@ -90,6 +90,26 @@ jobs:
           test -x "$HOME/zyc-clang/bin/clang"
           echo "$HOME/zyc-clang/bin" >> "$GITHUB_PATH"
 
+      - name: 工具链自检
+        run: |
+          set -ux
+          export PATH="$HOME/zyc-clang/bin:$PATH"
+          missing=0
+          for t in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-readelf llvm-strip; do
+            if command -v "$t" >/dev/null 2>&1; then
+              printf '  [ OK ] %-16s %s\n' "$t" "$(command -v $t)"
+            else
+              printf '  [MISS] %-16s 缺失\n' "$t"
+              missing=1
+            fi
+          done
+          echo "--- ld.lld 是不是包装脚本 ---"
+          file "$(command -v ld.lld 2>/dev/null)" 2>/dev/null || true
+          echo "--- 版本 ---"
+          clang --version 2>&1 | head -2 || true
+          ld.lld --version 2>&1 | head -2 || true
+          [ "$missing" -eq 0 ] || { echo "::error::工具链不完整"; exit 1; }
+
       - name: 应用 Droidspaces 官方 non-GKI 内核补丁
         run: |
           set -eux
@@ -152,10 +172,19 @@ jobs:
           set -euxo pipefail
           cd kernel
 
+          # 关键:LLVM 工具全部显式写在命令行上。
+          # 4.14 的 arch/arm64/Makefile 有 "LD += -EL";靠 LLVM=1 在 Makefile 内赋值时,
+          # 递归子 make(vdso)拿到的 LD 会为空 -> 命令变成 "-EL ..." -> 构建失败。
+          # 命令行变量通过 MAKEFLAGS 传到每一层子 make,因此不会再出现空值。
           MAKE_OPTS=(-j"$(nproc)" O=out ARCH=arm64 SUBARCH=arm64
-                     LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang"
+                     CC="ccache clang" HOSTCC="ccache clang"
+                     CLANG_TRIPLE=aarch64-linux-gnu-
                      CROSS_COMPILE=aarch64-linux-gnu-
-                     CROSS_COMPILE_ARM32=arm-linux-gnueabi-)
+                     CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+                     LLVM=1 LLVM_IAS=1
+                     LD=ld.lld AR=llvm-ar NM=llvm-nm
+                     OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump
+                     READELF=llvm-readelf STRIP=llvm-strip)
 
           make "${MAKE_OPTS[@]}" nabu_ds_defconfig
           make "${MAKE_OPTS[@]}" olddefconfig
@@ -230,8 +259,13 @@ jobs:
           set -eux
           cd kernel
           make -j"$(nproc)" O=out ARCH=arm64 SUBARCH=arm64 \
-               LLVM=1 LLVM_IAS=1 CC="ccache clang" HOSTCC="ccache clang" \
-               CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+               CC="ccache clang" HOSTCC="ccache clang" \
+               CLANG_TRIPLE=aarch64-linux-gnu- \
+               CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+               LLVM=1 LLVM_IAS=1 \
+               LD=ld.lld AR=llvm-ar NM=llvm-nm \
+               OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+               READELF=llvm-readelf STRIP=llvm-strip
           # nabu 的 BOARD_KERNEL_IMAGE_NAME 是 Image.gz(KERNEL_GZIP 默认 y)
           ls -la out/arch/arm64/boot/Image out/arch/arm64/boot/Image.gz 2>/dev/null || true
           file out/arch/arm64/boot/Image* 2>/dev/null || true
