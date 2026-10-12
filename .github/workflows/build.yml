@@ -78,6 +78,13 @@ jobs:
           echo "KERNEL_SHA=${SHA_SHORT}" >> "$GITHUB_ENV"
           echo "解析到的内核标识: ${SHA_SHORT}"
 
+      - name: ccache 配置
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          echo "CCACHE_COMPILERCHECK=content" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=3G" >> "$GITHUB_ENV"
+          echo "CCACHE_SLOPPINESS=time_macros,include_file_ctime,include_file_mtime" >> "$GITHUB_ENV"
+
       - name: 安装工具链 (ZyCromerZ Clang 16)
         run: |
           set -eux
@@ -109,6 +116,15 @@ jobs:
           clang --version 2>&1 | head -2 || true
           ld.lld --version 2>&1 | head -2 || true
           [ "$missing" -eq 0 ] || { echo "::error::工具链不完整"; exit 1; }
+
+      - name: ccache 缓存(让重复构建不再从零编译)
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ inputs.kernel_ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ inputs.kernel_ref }}-
+            ccache-
 
       - name: 应用 Droidspaces 官方 non-GKI 内核补丁
         run: |
