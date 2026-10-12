@@ -264,6 +264,28 @@ jobs:
             echo "         请把 kernel_ref 改成 16.0 重新构建。"
           fi
 
+          echo "========== E. LTO 可承载性(免费 runner 7GB 的硬约束) =========="
+          if grep -qx 'CONFIG_LTO_CLANG=y' out/.config; then
+            echo "  CONFIG_LTO_CLANG=y —— LTO 没有被关掉(有别的符号把它启用了)"
+            echo "  ---- 谁 select 了 LTO_CLANG ----"
+            grep -rn "select LTO_CLANG" --include='Kconfig*' . 2>/dev/null | head -5 || true
+            echo "  ---- 当前 out/.config 中 LTO/CFI 相关行 ----"
+            grep -nE "CONFIG_(LTO|THINLTO|CFI)" out/.config || true
+            echo "  ---- 合并后 defconfig 中的 LTO 行(确认片段确实被追加)----"
+            grep -nE "LTO" arch/arm64/configs/nabu_ds_defconfig || true
+            echo "  ---- 自动降级:强制启用 ThinLTO 并重新解析依赖 ----"
+            scripts/config --file out/.config -e THINLTO
+            make "${MAKE_OPTS[@]}" olddefconfig
+            grep -nE "CONFIG_(LTO_CLANG|THINLTO)" out/.config || true
+          fi
+
+          if grep -qx 'CONFIG_LTO_CLANG=y' out/.config && ! grep -qx 'CONFIG_THINLTO=y' out/.config; then
+            echo "  [FAIL] 自动降级后仍是完整 LTO —— 在 7GB runner 上必然 OOM,提前中止(省下约 50 分钟)"
+            fail=1
+          else
+            echo "  [ OK ] LTO 内存需求可控"
+          fi
+
           if [ "$fail" -ne 0 ]; then
             echo "::error::关键内核配置未生效,已中止(避免刷入一个起不了容器的内核)"
             exit 1
